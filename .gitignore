@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+.zsh28code/
+jobs/
+node_modules/
+hello.txt

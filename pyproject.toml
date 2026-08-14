@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zsh28code"
+version = "0.1.0"
+description = "zsh28code - An RLM-powered terminal coding agent for Terminal-Bench"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "zsh28code" }]
+dependencies = [
+    "openai>=1.60.0",
+    "requests>=2.31.0",
+    "rich>=13.9.0",
+    "textual>=0.86.0",
+    "pydantic>=2.10.0",
+    "sqlite-utils>=3.36.0",
+    "gitpython>=3.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+    "hatchling>=1.27.0",
+]
+harbor = [
+    "harbor>=0.16.0",
+]
+
+[project.scripts]
+zsh28code = "zsh28code.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["zsh28code"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
