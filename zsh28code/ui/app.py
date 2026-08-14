@@ -220,6 +220,11 @@ class Zsh28App(App):
         tools = get_default_tools(
             context_store=self.context,
             firecrawl_api_key=os.environ.get("FIRECRAWL_API_KEY"),
+            agent_factory=self._spawn_rlm_agent,
+            max_rlm_depth=self.config.rlm_depth,
+            model=self.config.model,
+            base_url=self.config.base_url,
+            api_key=self.config.api_key,
         )
 
         if self.config.api_key:
@@ -245,6 +250,14 @@ class Zsh28App(App):
         if self._task_input:
             self.conv.add_message("user", self._task_input)
             self._pending_task = asyncio.create_task(self.submit_task(self._task_input))
+
+    async def _spawn_rlm_agent(
+        self, query: str, context: str, depth: int, max_depth: int
+    ) -> str:
+        """Delegate a focused context chunk to a bounded child agent."""
+        if self.agent is None:
+            return "RLM unavailable until the root agent is initialized."
+        return await self.agent._spawn_rlm_agent(query, context, depth, max_depth)
 
     async def on_unmount(self) -> None:
         """Cancel active work before tearing down the Textual app."""

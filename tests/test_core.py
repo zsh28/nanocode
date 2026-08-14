@@ -103,6 +103,16 @@ class TestTools:
             result = await read.execute({"path": str(filepath)})
             assert "test content" in result
 
+            from zsh28code.tools.file import EditFileTool
+            edit = EditFileTool()
+            result = await edit.execute({
+                "path": str(filepath),
+                "old_string": "test",
+                "new_string": "updated",
+            })
+            assert "Edited" in result
+            assert filepath.read_text() == "updated content"
+
     @pytest.mark.asyncio
     async def test_todo_tool(self):
         from zsh28code.tools.web import TodoWriteTool
@@ -406,3 +416,46 @@ class TestTrajectory:
         atif = convert_to_atif(traj, "test-session")
         assert atif["session_id"] == "test-session"
         assert len(atif["steps"]) >= 2
+
+
+class TestHarborAdapter:
+    """Tests for the direct Harbor execution boundary."""
+
+    @pytest.mark.asyncio
+    async def test_exec_bash_uses_command_timeout_and_formats_output(self):
+        from zsh28code.benchmark.harbor_agent import Zsh28Code
+
+        class FakeResult:
+            stdout = "hello"
+            stderr = ""
+            return_code = 0
+
+        class FakeEnvironment:
+            async def exec(self, **kwargs):
+                self.kwargs = kwargs
+                return FakeResult()
+
+        agent = Zsh28Code(
+            logs_dir=Path(tempfile.mkdtemp()),
+            extra_env={"OPENROUTER_API_KEY": "test"},
+            command_timeout=7,
+        )
+        environment = FakeEnvironment()
+        result = await agent._exec_bash(environment, "pwd")
+
+        assert result == "STDOUT:\nhello\nEXIT CODE: 0"
+        assert environment.kwargs["command"] == "pwd"
+        assert environment.kwargs["timeout_sec"] == 7
+
+    def test_adapter_truncates_large_output(self):
+        from zsh28code.benchmark.harbor_agent import Zsh28Code
+
+        agent = Zsh28Code(
+            logs_dir=Path(tempfile.mkdtemp()),
+            extra_env={"OPENROUTER_API_KEY": "test"},
+            max_output_bytes=1000,
+        )
+        result = agent._truncate("a" * 2000)
+
+        assert len(result.encode()) <= 1030
+        assert "truncated" in result
