@@ -246,6 +246,17 @@ class Zsh28App(App):
             self.conv.add_message("user", self._task_input)
             self._pending_task = asyncio.create_task(self.submit_task(self._task_input))
 
+    async def on_unmount(self) -> None:
+        """Cancel active work before tearing down the Textual app."""
+        if self._pending_task and not self._pending_task.done():
+            self._pending_task.cancel()
+            try:
+                await self._pending_task
+            except asyncio.CancelledError:
+                pass
+        if self.agent:
+            await self.agent.aclose()
+
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="conv-container"):
@@ -317,12 +328,18 @@ class Zsh28App(App):
                     self.conv.add_message("assistant", partial["content"], metadata=partial.get("metadata", "AGENT"))
                 elif partial["role"] == "tool":
                     self.conv.add_message("tool", partial["content"], metadata=f"[{datetime.now().strftime('%H:%M:%S')}]")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             self.conv.add_message("system", f"Error: {e}", metadata="zsh28code")
         finally:
-            self.status.update_status("ready")
-            self._pending = False
-            self.query_one("#user-input", Input).focus()
+            if self.is_running:
+                self.status.update_status("ready")
+                self._pending = False
+                try:
+                    self.query_one("#user-input", Input).focus()
+                except Exception:
+                    pass
 
 
 __all__ = ["Zsh28App"]

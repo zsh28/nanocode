@@ -159,6 +159,7 @@ class TestAgentLoop:
         assert "Start every task by running `pwd`" in prompt
         assert "MUST use" in prompt
         assert "Do not merely explain" in prompt
+        assert "## Ambiguous Requests" in prompt
 
     @pytest.mark.asyncio
     async def test_text_response_completes(self):
@@ -225,6 +226,27 @@ class TestAgentLoop:
         assert "second task" in second_input
         assert "first task" not in second_input
         assert "First complete" not in second_input
+
+    @pytest.mark.asyncio
+    async def test_sequential_tasks_reset_iteration_counter(self):
+        agent = ScriptedAgent(
+            [
+                ("first", [], "stop"),
+                ("second", [], "stop"),
+            ],
+            config=Config(api_key="test", max_iterations=1),
+            tools=[],
+            context_store=ContextStore(),
+            headless=True,
+        )
+        try:
+            first = await agent.run_headless("first")
+            second = await agent.run_headless("second")
+        finally:
+            await agent.aclose()
+
+        assert first.iterations == 1
+        assert second.iterations == 1
 
     @pytest.mark.asyncio
     async def test_bash_completion_signal_completes(self):
@@ -302,6 +324,26 @@ class TestAgentLoop:
 
         assert result.completed
         assert any("User denied the tool call" in entry["content"] for entry in agent.trajectory)
+
+    @pytest.mark.asyncio
+    async def test_malformed_tool_arguments_are_recoverable(self):
+        agent = ScriptedAgent(
+            [
+                ("", [{"id": "bad", "name": "bash", "arguments": "{"}], "tool_calls"),
+                ("Please clarify the command.", [], "stop"),
+            ],
+            config=Config(api_key="test", max_iterations=3),
+            tools=[BashTool()],
+            context_store=ContextStore(),
+            headless=True,
+        )
+        try:
+            result = await agent.run_headless("run something")
+        finally:
+            await agent.aclose()
+
+        assert result.completed
+        assert any("Error parsing arguments" in entry["content"] for entry in agent.trajectory)
 
 
 class TestMemoryDB:

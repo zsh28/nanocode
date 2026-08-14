@@ -173,6 +173,13 @@ the `write`, `edit`, or `bash` tool to perform the change. Do not merely explain
 the code or claim that a file was created. After the tool succeeds, verify the
 file exists and contains the requested change before completing the task.
 
+## Ambiguous Requests
+If the request is missing a required target, action, or expected result, do not
+guess and do not claim completion. Ask one concise clarification question. For
+example, ask which file, directory, or behavior the user means. If you can make
+safe progress without guessing, inspect the workspace first and then report the
+specific missing detail.
+
 ## Completion — VERY IMPORTANT
 CRITICAL: The ONLY way to signal task completion is to run this exact command as
 your final bash call — do NOT add any other text or instructions alongside it:
@@ -250,6 +257,7 @@ but the completion signal must be on its own line as the last thing you do.
     def _begin_task(self, task: str) -> None:
         """Start a fresh model task while retaining the searchable workspace history."""
         self._task_start_index = len(self.context._entries)
+        self._iteration = 0
         system_prompt = self._build_system_prompt(task)
         self.context.add(EntryType.SYSTEM, "system", system_prompt)
         self.context.add(EntryType.USER, "user", task)
@@ -481,13 +489,18 @@ but the completion signal must be on its own line as the last thing you do.
                         if auto_approve:
                             result, is_error = await self._execute_tool_call(tc, tool)
                         else:
-                            arguments = json.loads(tc["arguments"])
-                            approved = await self._approve_tool_call(tool, arguments)
-                            if approved:
-                                result, is_error = await self._execute_tool_call(tc, tool)
-                            else:
-                                result = "User denied the tool call."
+                            try:
+                                arguments = json.loads(tc["arguments"])
+                            except json.JSONDecodeError as error:
+                                result = f"Error parsing arguments for {tc['name']}: {error}"
                                 is_error = True
+                            else:
+                                approved = await self._approve_tool_call(tool, arguments)
+                                if approved:
+                                    result, is_error = await self._execute_tool_call(tc, tool)
+                                else:
+                                    result = "User denied the tool call."
+                                    is_error = True
 
                     # Store in context
                     self.context.add(
@@ -642,17 +655,24 @@ but the completion signal must be on its own line as the last thing you do.
                         result = f"Error: Unknown tool {tc['name']}"
                         is_error = True
                     else:
-                        arguments = json.loads(tc["arguments"])
-                        yield {
-                            "role": "status",
-                            "content": f"running {tc['name']}",
-                            "metadata": "",
-                        }
-                        approved = await self._approve_tool_call(tool, arguments)
-                        if approved:
-                            result, is_error = await self._execute_tool_call(tc, tool)
-                        else:
-                            result, is_error = "User denied the tool call.", True
+                        try:
+                            arguments = json.loads(tc["arguments"])
+                        except json.JSONDecodeError as error:
+                            result = f"Error parsing arguments for {tc['name']}: {error}"
+                            is_error = True
+                            arguments = None
+
+                        if arguments is not None:
+                            yield {
+                                "role": "status",
+                                "content": f"running {tc['name']}",
+                                "metadata": "",
+                            }
+                            approved = await self._approve_tool_call(tool, arguments)
+                            if approved:
+                                result, is_error = await self._execute_tool_call(tc, tool)
+                            else:
+                                result, is_error = "User denied the tool call.", True
 
                     ts = _dt.datetime.now().strftime("%H:%M:%S")
                     yield {"role": "tool", "content": result, "metadata": f"[{tc['name']}] {ts}"}
