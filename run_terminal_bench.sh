@@ -12,6 +12,7 @@ fi
 
 N_TASKS="${ZSH28CODE_BENCH_TASKS:-1}"
 CONCURRENT="${ZSH28CODE_BENCH_CONCURRENT:-1}"
+TIMEOUT_MULTIPLIER="${ZSH28CODE_BENCH_TIMEOUT_MULTIPLIER:-0.5}"
 JOB_NAME="${ZSH28CODE_BENCH_JOB_NAME:-zsh28code-tbench-2-1-$(date +%Y%m%d-%H%M%S)}"
 
 if [[ "$N_TASKS" != "all" && ! "$N_TASKS" =~ ^[1-9][0-9]*$ ]]; then
@@ -41,6 +42,7 @@ HARBOR_ARGS=(
   --model openrouter/poolside/laguna-s-2.1:free
   --n-concurrent "$CONCURRENT"
   --n-attempts 1
+  --agent-timeout-multiplier "$TIMEOUT_MULTIPLIER"
   --yes
   --job-name "$JOB_NAME"
 )

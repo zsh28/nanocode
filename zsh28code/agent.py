@@ -58,6 +58,7 @@ class Agent:
         self.context = context_store or ContextStore()
         self.headless = headless
         self.approval_callback = approval_callback
+        self._task_start_index = 0
 
         if tools is not None:
             self.tools = tools
@@ -206,11 +207,7 @@ but the completion signal must be on its own line as the last thing you do.
 
         Used for rlm_agent recursion and headless benchmark mode.
         """
-        system_prompt = self._build_system_prompt(prompt)
-        self.context.add(EntryType.SYSTEM, "system", system_prompt)
-        self.context.add(EntryType.USER, "user", prompt)
-        self._record_trajectory(role="system", content=system_prompt)
-        self._record_trajectory(role="user", content=prompt)
+        self._begin_task(prompt)
 
         result = await self._loop(auto_approve=auto_approve)
         return result.submission if result.completed else result.reason
@@ -233,13 +230,14 @@ but the completion signal must be on its own line as the last thing you do.
             messages.append({"role": "system", "content": system_entries[-1].content})
 
         # User instruction (first user message)
-        user_entries = [e for e in entries if e.type == EntryType.USER]
+        user_entries = [e for e in entries[self._task_start_index:] if e.type == EntryType.USER]
         if user_entries:
             messages.append({"role": "user", "content": user_entries[0].content})
 
         # Recent summary (compressed assistant + tool entries)
         recent = self.context.recent_summary(
-            max_tokens=self.config.recent_summary_tokens
+            max_tokens=self.config.recent_summary_tokens,
+            start_index=self._task_start_index,
         )
         if recent:
             messages.append({
@@ -248,6 +246,15 @@ but the completion signal must be on its own line as the last thing you do.
             })
 
         return messages
+
+    def _begin_task(self, task: str) -> None:
+        """Start a fresh model task while retaining the searchable workspace history."""
+        self._task_start_index = len(self.context._entries)
+        system_prompt = self._build_system_prompt(task)
+        self.context.add(EntryType.SYSTEM, "system", system_prompt)
+        self.context.add(EntryType.USER, "user", task)
+        self._record_trajectory(role="system", content=system_prompt)
+        self._record_trajectory(role="user", content=task)
 
     def _should_summarize_tool_result(self, content: str, tool_name: str) -> str:
         """Determine if a tool result should be summarized or included directly.
@@ -550,12 +557,7 @@ but the completion signal must be on its own line as the last thing you do.
 
     async def run(self, task: str, auto_approve: bool = False) -> AgentResult:
         """Run the agent on a task in interactive mode."""
-        system_prompt = self._build_system_prompt(task)
-
-        self.context.add(EntryType.SYSTEM, "system", system_prompt)
-        self.context.add(EntryType.USER, "user", task)
-        self._record_trajectory(role="system", content=system_prompt)
-        self._record_trajectory(role="user", content=task)
+        self._begin_task(task)
 
         print(f"\nzsh28code: {task}\n", flush=True)
 
@@ -563,12 +565,7 @@ but the completion signal must be on its own line as the last thing you do.
 
     async def run_headless(self, task: str) -> AgentResult:
         """Run the agent in headless mode (no TUI, plain text output)."""
-        system_prompt = self._build_system_prompt(task)
-
-        self.context.add(EntryType.SYSTEM, "system", system_prompt)
-        self.context.add(EntryType.USER, "user", task)
-        self._record_trajectory(role="system", content=system_prompt)
-        self._record_trajectory(role="user", content=task)
+        self._begin_task(task)
 
         return await self._loop(auto_approve=True)
 
@@ -577,11 +574,7 @@ but the completion signal must be on its own line as the last thing you do.
 
         Yields dicts: {"role": "assistant"|"tool", "content": str, "metadata": str}
         """
-        system_prompt = self._build_system_prompt(task)
-        self.context.add(EntryType.SYSTEM, "system", system_prompt)
-        self.context.add(EntryType.USER, "user", task)
-        self._record_trajectory(role="system", content=system_prompt)
-        self._record_trajectory(role="user", content=task)
+        self._begin_task(task)
 
         last_tool_signature = ""
         repeated_tool_calls = 0

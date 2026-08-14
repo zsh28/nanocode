@@ -185,7 +185,7 @@ class ContextStore:
             matched_count=1 if excerpt else 0,
         )
 
-    def recent_summary(self, max_tokens: int = 2000) -> str:
+    def recent_summary(self, max_tokens: int = 2000, start_index: int = 0) -> str:
         """Generate a compressed summary of recent entries for the LLM input.
 
         This is what gets sent to the LLM alongside the system prompt and task.
@@ -196,7 +196,8 @@ class ContextStore:
         parts: list[str] = []
         token_budget = max_tokens * 4  # rough char budget
 
-        for entry in reversed(self._entries):
+        entries = self._entries[max(0, start_index):]
+        for entry in reversed(entries):
             if token_budget <= 0:
                 break
 

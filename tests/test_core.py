@@ -204,6 +204,29 @@ class TestAgentLoop:
         assert "printf hello" in str(agent.seen_messages[1])
 
     @pytest.mark.asyncio
+    async def test_sequential_tasks_use_current_prompt(self):
+        agent = ScriptedAgent(
+            [
+                ("First complete", [], "stop"),
+                ("Second complete", [], "stop"),
+            ],
+            config=Config(api_key="test", max_iterations=2),
+            tools=[],
+            context_store=ContextStore(),
+            headless=True,
+        )
+        try:
+            await agent.run_headless("first task")
+            await agent.run_headless("second task")
+        finally:
+            await agent.aclose()
+
+        second_input = str(agent.seen_messages[1])
+        assert "second task" in second_input
+        assert "first task" not in second_input
+        assert "First complete" not in second_input
+
+    @pytest.mark.asyncio
     async def test_bash_completion_signal_completes(self):
         tool_call = {
             "id": "call-1",
