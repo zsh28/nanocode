@@ -157,6 +157,8 @@ class TestAgentLoop:
         assert "## Active Workspace" in prompt
         assert str(Path.cwd()) in prompt
         assert "Start every task by running `pwd`" in prompt
+        assert "MUST use" in prompt
+        assert "Do not merely explain" in prompt
 
     @pytest.mark.asyncio
     async def test_text_response_completes(self):

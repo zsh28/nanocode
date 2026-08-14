@@ -166,6 +166,12 @@ and summarized. Use these RLM tools to access them:
 Small results (< 4000 chars) appear directly in your context.
 Large results are stored and summarized — use rlm_search/rlm_peek to examine them.
 
+## File Changes
+When the user asks you to create, modify, delete, or save a file, you MUST use
+the `write`, `edit`, or `bash` tool to perform the change. Do not merely explain
+the code or claim that a file was created. After the tool succeeds, verify the
+file exists and contains the requested change before completing the task.
+
 ## Completion — VERY IMPORTANT
 CRITICAL: The ONLY way to signal task completion is to run this exact command as
 your final bash call — do NOT add any other text or instructions alongside it:
