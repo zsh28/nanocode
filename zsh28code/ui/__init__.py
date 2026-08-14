@@ -39,7 +39,12 @@ def run_headless(config, prompt: str, args: argparse.Namespace | None = None) ->
 
     store = ContextStore()
 
-    def _spawn_rlm_agent(query: str, context: str, depth: int, max_depth: int) -> str:
+    async def _spawn_rlm_agent(
+        query: str,
+        context: str,
+        depth: int,
+        max_depth: int,
+    ) -> str:
         """Spawn a sub-agent for RLM recursion (headless)."""
         from zsh28code.agent import Agent
         from zsh28code.context import ContextStore
@@ -67,16 +72,19 @@ def run_headless(config, prompt: str, args: argparse.Namespace | None = None) ->
             headless=True,
         )
 
-        loop = asyncio.new_event_loop()
         try:
-            result = loop.run_until_complete(sub_agent.run_headless(query))
+            focused_prompt = (
+                f"Task: {query}\n\n"
+                f"Focused context:\n{context[:50000]}\n\n"
+                f"Recursion depth: {depth}/{max_depth}"
+            )
+            result = await sub_agent.run_headless(focused_prompt)
         finally:
-            loop.run_until_complete(sub_agent.aclose())
-            loop.close()
+            await sub_agent.aclose()
 
         return result.submission if result.completed else result.reason
 
-    tools = get_headless_tools(
+    tools = [] if (args and getattr(args, "no_tools", False)) else get_headless_tools(
         context_store=store,
         agent_factory=_spawn_rlm_agent,
     )

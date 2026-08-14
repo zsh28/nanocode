@@ -33,7 +33,7 @@ class BashTool(Tool):
     is_read_only = False
 
     async def execute(self, args: dict[str, Any]) -> str:
-        command = args["command"]
+        command = f"set -o pipefail; {args['command']}"
         timeout = args.get("timeout", 60)
 
         start = time.time()

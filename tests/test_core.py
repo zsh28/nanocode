@@ -3,6 +3,7 @@
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,13 @@ from zsh28code.config import Config
 from zsh28code.context import ContextStore, EntryType
 from zsh28code.self_improve.memory import MemoryDB
 from zsh28code.tools.shell import BashTool
+from zsh28code.runtime import (
+    AgentRuntime,
+    ModelTurn,
+    RuntimeToolCall,
+    ToolOutcome,
+    tool_output_is_error,
+)
 
 
 class ScriptedAgent(Agent):
@@ -79,6 +87,87 @@ class TestContextStore:
         assert "bash" in summary
 
 
+class TestSharedRuntime:
+    """Behavior shared by local, TUI, and Harbor execution modes."""
+
+    @pytest.mark.asyncio
+    async def test_runtime_executes_tool_and_completes(self):
+        turns = iter([
+            ModelTurn(
+                tool_calls=[RuntimeToolCall("call-1", "write", '{"path":"x"}')],
+                finish_reason="tool_calls",
+            ),
+            ModelTurn(content="Created the file.", finish_reason="stop"),
+        ])
+        calls = []
+
+        async def call_model(_iteration):
+            return next(turns)
+
+        async def execute_tool(call, arguments):
+            calls.append((call.name, arguments))
+            return ToolOutcome("Wrote x")
+
+        result = await AgentRuntime(
+            task="Create x",
+            max_iterations=3,
+            call_model=call_model,
+            execute_tool=execute_tool,
+        ).run()
+
+        assert result.completed
+        assert calls == [("write", {"path": "x"})]
+
+    @pytest.mark.asyncio
+    async def test_runtime_rejects_claim_without_action(self):
+        async def call_model(_iteration):
+            return ModelTurn(content="Done.", finish_reason="stop")
+
+        async def execute_tool(_call, _arguments):
+            raise AssertionError("tool should not execute")
+
+        result = await AgentRuntime(
+            task="Edit x",
+            max_iterations=1,
+            call_model=call_model,
+            execute_tool=execute_tool,
+        ).run()
+
+        assert not result.completed
+        assert "no tool completed successfully" in result.reason.lower()
+
+    def test_bash_nonzero_exit_is_an_error(self):
+        assert tool_output_is_error("bash", "[exit=1 elapsed=0.1s]\nfailed")
+        assert tool_output_is_error("bash", "STDERR:\nfailed\nEXIT CODE: 2")
+        assert not tool_output_is_error("bash", "[exit=0 elapsed=0.1s]\nok")
+
+    @pytest.mark.asyncio
+    async def test_read_only_success_does_not_validate_completion(self):
+        turns = iter([
+            ModelTurn(
+                tool_calls=[RuntimeToolCall("call-1", "bash", '{"command":"ls /app"}')],
+                finish_reason="tool_calls",
+            ),
+            ModelTurn(content="Done.", finish_reason="stop"),
+        ])
+
+        async def call_model(_iteration):
+            return next(turns)
+
+        async def execute_tool(_call, _arguments):
+            return ToolOutcome("file.txt", counts_as_action=False)
+
+        result = await AgentRuntime(
+            task="Create /app/file.txt",
+            max_iterations=2,
+            call_model=call_model,
+            execute_tool=execute_tool,
+        ).run()
+
+        assert not result.completed
+        assert "no tool completed successfully" in result.reason.lower()
+
+
 class TestTools:
     """Tests for agent tools."""
 
@@ -89,6 +178,11 @@ class TestTools:
         result = await tool.execute({"command": "echo hello"})
         assert "hello" in result
         assert "exit=0" in result
+
+    @pytest.mark.asyncio
+    async def test_bash_tool_propagates_pipeline_failure(self):
+        result = await BashTool().execute({"command": "false | true"})
+        assert "exit=1" in result
 
     @pytest.mark.asyncio
     async def test_read_write_tools(self):
@@ -188,6 +282,23 @@ class TestAgentLoop:
         assert result.completed
         assert result.submission == "Finished successfully."
         assert result.iterations == 1
+
+    @pytest.mark.asyncio
+    async def test_action_request_without_tool_is_not_marked_complete(self):
+        agent = ScriptedAgent(
+            [("I created the file.", [], "stop")],
+            config=Config(api_key="test", max_iterations=2),
+            tools=[],
+            context_store=ContextStore(),
+            headless=True,
+        )
+        try:
+            result = await agent.run_headless("Create hello.py")
+        finally:
+            await agent.aclose()
+
+        assert not result.completed
+        assert "no tool completed successfully" in result.reason.lower()
 
     @pytest.mark.asyncio
     async def test_tool_arguments_are_visible_next_turn(self):
@@ -332,7 +443,8 @@ class TestAgentLoop:
         finally:
             await agent.aclose()
 
-        assert result.completed
+        assert not result.completed
+        assert "no tool completed successfully" in result.reason.lower()
         assert any("User denied the tool call" in entry["content"] for entry in agent.trajectory)
 
     @pytest.mark.asyncio
@@ -352,8 +464,52 @@ class TestAgentLoop:
         finally:
             await agent.aclose()
 
-        assert result.completed
+        assert not result.completed
+        assert "no tool completed successfully" in result.reason.lower()
         assert any("Error parsing arguments" in entry["content"] for entry in agent.trajectory)
+
+    @pytest.mark.asyncio
+    async def test_tui_stream_uses_shared_runtime_events(self):
+        tool_call = {
+            "id": "call-1",
+            "name": "bash",
+            "arguments": json.dumps({"command": "printf created"}),
+        }
+        agent = ScriptedAgent(
+            [
+                ("", [tool_call], "tool_calls"),
+                ("Created it.", [], "stop"),
+            ],
+            config=Config(api_key="test", max_iterations=3),
+            tools=[BashTool()],
+            context_store=ContextStore(),
+            headless=True,
+        )
+        try:
+            events = [event async for event in agent.run_stream("Create it")]
+        finally:
+            await agent.aclose()
+
+        assert any(event["role"] == "status" for event in events)
+        assert any(event["role"] == "tool" and "created" in event["content"] for event in events)
+        assert any(event["role"] == "assistant" and "Created it" in event["content"] for event in events)
+
+    @pytest.mark.asyncio
+    async def test_rlm_agent_awaits_async_factory(self):
+        from zsh28code.tools.rlm import RlmAgentTool
+
+        async def factory(query, context, depth, max_depth):
+            return f"{query}:{context}:{depth}/{max_depth}"
+
+        tool = RlmAgentTool()
+        tool.configure(factory, max_depth=3)
+        result = await tool.execute({
+            "query": "explain",
+            "context_chunk": "focused",
+            "depth": 1,
+        })
+
+        assert "explain:focused:1/3" in result
 
 
 class TestMemoryDB:
@@ -444,7 +600,7 @@ class TestHarborAdapter:
         result = await agent._exec_bash(environment, "pwd")
 
         assert result == "STDOUT:\nhello\nEXIT CODE: 0"
-        assert environment.kwargs["command"] == "pwd"
+        assert environment.kwargs["command"] == "set -o pipefail; pwd"
         assert environment.kwargs["timeout_sec"] == 7
 
     def test_adapter_truncates_large_output(self):
@@ -459,3 +615,59 @@ class TestHarborAdapter:
 
         assert len(result.encode()) <= 1030
         assert "truncated" in result
+
+    @pytest.mark.asyncio
+    async def test_harbor_uses_shared_runtime_for_tool_loop(self):
+        from harbor.models.agent.context import AgentContext
+        from zsh28code.benchmark.harbor_agent import Zsh28Code
+
+        tool_call = SimpleNamespace(
+            id="call-1",
+            function=SimpleNamespace(
+                name="bash",
+                arguments=json.dumps({"command": "touch /app/result"}),
+            ),
+        )
+        responses = iter([
+            SimpleNamespace(
+                usage=None,
+                choices=[SimpleNamespace(
+                    finish_reason="tool_calls",
+                    message=SimpleNamespace(content="", tool_calls=[tool_call]),
+                )],
+            ),
+            SimpleNamespace(
+                usage=None,
+                choices=[SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content="Finished.", tool_calls=[]),
+                )],
+            ),
+        ])
+
+        class FakeCompletions:
+            def create(self, **_kwargs):
+                return next(responses)
+
+        class FakeEnvironment:
+            async def exec(self, **kwargs):
+                self.commands = getattr(self, "commands", []) + [kwargs["command"]]
+                return SimpleNamespace(stdout="", stderr="", return_code=0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent = Zsh28Code(
+                logs_dir=Path(tmpdir),
+                extra_env={"OPENROUTER_API_KEY": "test"},
+                max_episodes=3,
+            )
+            agent._client = SimpleNamespace(
+                chat=SimpleNamespace(completions=FakeCompletions())
+            )
+            environment = FakeEnvironment()
+            context = AgentContext()
+
+            await agent.run("Create /app/result", environment, context)
+
+            assert environment.commands == ["set -o pipefail; touch /app/result"]
+            assert context.metadata["completed"] is True
+            assert (Path(tmpdir) / "trajectory.json").exists()

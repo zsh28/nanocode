@@ -12,6 +12,11 @@ The project has two execution paths:
   inference runs in the host Harbor process, while bash commands execute inside
   each isolated task environment.
 
+Both paths use the same `AgentRuntime` for model turns, tool argument parsing,
+repetition guards, completion validation, and runtime events. Mode-specific
+adapters only decide how to call the model, where tools execute, and how logs are
+persisted. This keeps Terminal-Bench behavior aligned with the local agent.
+
 ## Features
 
 ### Local terminal agent
@@ -426,7 +431,8 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in a browser.
 ```text
 zsh28code/
 ├── __main__.py              CLI argument parsing and mode selection
-├── agent.py                 Core loop, tool calls, context focus, RLM recursion
+├── agent.py                 Local model/context/tool adapter and RLM recursion
+├── runtime.py               Shared local/TUI/Harbor orchestration state machine
 ├── context.py               Searchable context store and recent summaries
 ├── config.py                Runtime configuration and environment variables
 ├── llm.py                   Async OpenAI/OpenRouter wrapper

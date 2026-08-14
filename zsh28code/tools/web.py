@@ -1,5 +1,6 @@
 """Todo write and web tools."""
 
+import asyncio
 from typing import Any
 
 import requests
@@ -75,11 +76,16 @@ class WebFetchTool(Tool):
 
     async def execute(self, args: dict[str, Any]) -> str:
         url = args["url"]
+        return await self.fetch(url)
+
+    async def fetch(self, url: str) -> str:
+        """Fetch one URL as markdown for tools and autoresearch."""
         if not self._api_key:
             return "Error: FIRECRAWL_API_KEY not configured. Set OPENROUTER_API_KEY and FIRECRAWL_API_KEY."
 
         try:
-            response = requests.post(
+            response = await asyncio.to_thread(
+                requests.post,
                 "https://api.firecrawl.dev/v1/scrape",
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 json={"url": url, "formats": ["markdown"]},
@@ -122,11 +128,26 @@ class WebSearchTool(Tool):
     async def execute(self, args: dict[str, Any]) -> str:
         query = args["query"]
         limit = args.get("limit", 5)
+        results = await self.search(query, limit)
+        if isinstance(results, str):
+            return results
+        lines = []
+        for result in results:
+            lines.append(
+                f"{result.get('title', 'N/A')}\n"
+                f"{result.get('url', 'N/A')}\n"
+                f"{result.get('description', '')}"
+            )
+        return "\n\n".join(lines)
+
+    async def search(self, query: str, limit: int = 5) -> list[dict[str, Any]] | str:
+        """Return structured search results for tools and autoresearch."""
         if not self._api_key:
             return "Error: FIRECRAWL_API_KEY not configured."
 
         try:
-            response = requests.post(
+            response = await asyncio.to_thread(
+                requests.post,
                 "https://api.firecrawl.dev/v2/search",
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 json={"query": query, "limit": limit, "sources": ["web"]},
@@ -137,13 +158,7 @@ class WebSearchTool(Tool):
             if not results:
                 return "No results found."
 
-            lines = []
-            for r in results:
-                title = r.get("title", "N/A")
-                url = r.get("url", "N/A")
-                desc = r.get("description", "")
-                lines.append(f"{title}\n{url}\n{desc}")
-            return "\n\n".join(lines)
+            return results
         except requests.RequestException as e:
             return f"Error searching web: {e}"
         except (KeyError, IndexError) as e:

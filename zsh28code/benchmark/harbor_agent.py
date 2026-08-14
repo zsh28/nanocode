@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import time
 from pathlib import Path
 from typing import Any, override
 
@@ -21,6 +23,14 @@ from openai import OpenAI
 
 from zsh28code.benchmark.trajectory import convert_to_atif
 from zsh28code.context import ContextStore, EntryType
+from zsh28code.runtime import (
+    AgentRuntime,
+    ModelTurn,
+    RuntimeEvent,
+    RuntimeToolCall,
+    ToolOutcome,
+    tool_output_is_error,
+)
 
 DEFAULT_MODEL = "poolside/laguna-s-2.1:free"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
@@ -32,13 +42,16 @@ SYSTEM_PROMPT = """You are zsh28code, a terminal agent solving a Terminal-Bench 
 Use the bash tool to do the work in the task environment.
 
 Workflow:
-1. Inspect the environment with pwd, ls, and relevant files.
-2. Implement the requested solution using bash commands.
+1. Inspect the environment with pwd, ls /app, and relevant files.
+2. Implement the requested solution early; do not spend more than three turns
+   on environment discovery before creating or editing the required artifact.
 3. Run focused verification and tests.
 4. Only stop after the requested files or behavior are actually complete.
 
 Never claim a file was created or changed unless a bash command performed it and
-you verified the result. Keep commands focused and recover from command errors.
+you verified the result. Do not scan the entire root filesystem or install
+packages unless the task explicitly requires it or a focused test proves it is
+necessary. Keep commands focused and recover from command errors.
 When finished, respond with a concise summary and do not call bash again."""
 
 BASH_TOOL = {
@@ -138,13 +151,20 @@ class Zsh28Code(BaseAgent):
         self._max_episodes = max(1, int(max_episodes))
         self._command_timeout = max(1, int(command_timeout))
         self._max_output_bytes = max(1000, int(max_output_bytes))
-        self._client = OpenAI(base_url=self._base_url, api_key=self._api_key)
+        self._client = OpenAI(
+            base_url=self._base_url,
+            api_key=self._api_key,
+            timeout=60.0,
+            max_retries=0,
+        )
         self._messages: list[dict[str, Any]] = []
         self._context = ContextStore()
         self._trajectory: list[dict[str, Any]] = []
         self._input_tokens = 0
         self._output_tokens = 0
         self._episodes_run = 0
+        self._recent_commands: list[str] = []
+        self._recent_categories: list[str] = []
 
     @staticmethod
     @override
@@ -162,7 +182,7 @@ class Zsh28Code(BaseAgent):
         self.logger.info("Environment ready:\n%s", result.stdout[:2000])
 
     @override
-    async def run(
+    async def _legacy_run(
         self,
         instruction: str,
         environment: BaseEnvironment,
@@ -182,6 +202,8 @@ class Zsh28Code(BaseAgent):
         self._input_tokens = 0
         self._output_tokens = 0
         self._episodes_run = 0
+        self._recent_commands = []
+        self._recent_categories = []
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -262,7 +284,12 @@ class Zsh28Code(BaseAgent):
                     else:
                         self.logger.info("Episode %d executing: %s", episode, command[:240])
                         if call.function.name == "bash":
-                            tool_output = await self._exec_bash(environment, command)
+                            if self._recent_commands[-3:] == [command] * 3:
+                                tool_output = "Error: repeated the same bash command three times; choose a different diagnostic or implementation step."
+                            else:
+                                self._recent_commands.append(command)
+                                self._recent_commands = self._recent_commands[-10:]
+                                tool_output = await self._exec_bash(environment, command)
                         else:
                             tool_output = await self._execute_rlm(call.function.name, args)
 
@@ -297,19 +324,247 @@ class Zsh28Code(BaseAgent):
                 encoding="utf-8",
             )
 
+    @override
+    async def run(
+        self,
+        instruction: str,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        """Run the shared AgentRuntime with Harbor-specific adapters."""
+        self._messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": instruction},
+        ]
+        self._context = ContextStore()
+        self._context.add(EntryType.SYSTEM, "system", SYSTEM_PROMPT)
+        self._context.add(EntryType.USER, "user", instruction)
+        self._trajectory = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": instruction},
+        ]
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._episodes_run = 0
+        self._recent_commands = []
+        self._recent_categories = []
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        episode_dirs: dict[int, Path] = {}
+
+        async def call_model(iteration: int) -> ModelTurn:
+            self._episodes_run = iteration
+            episode_dir = self.logs_dir / f"episode-{iteration - 1:03d}"
+            episode_dirs[iteration] = episode_dir
+            episode_dir.mkdir(parents=True, exist_ok=True)
+            model_messages = self._messages_for_model()
+            (episode_dir / "messages.json").write_text(
+                json.dumps(model_messages, indent=2),
+                encoding="utf-8",
+            )
+            self.logger.info(
+                "Episode %d/%d: querying %s",
+                iteration,
+                self._max_episodes,
+                self._model,
+            )
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._client.chat.completions.create,
+                    model=self._model,
+                    messages=model_messages,
+                    tools=[BASH_TOOL, *RLM_TOOLS],
+                    tool_choice="auto",
+                    temperature=0.2,
+                    max_tokens=8192,
+                ),
+                timeout=75,
+            )
+            usage = response.usage
+            if usage:
+                self._input_tokens += usage.prompt_tokens or 0
+                self._output_tokens += usage.completion_tokens or 0
+            self._sync_context(context)
+            message = response.choices[0].message
+            calls = [
+                RuntimeToolCall(
+                    id=call.id,
+                    name=call.function.name,
+                    arguments=call.function.arguments,
+                )
+                for call in (message.tool_calls or [])
+            ]
+            (episode_dir / "response.json").write_text(
+                json.dumps(
+                    {
+                        "content": message.content,
+                        "finish_reason": response.choices[0].finish_reason,
+                        "tool_calls": [
+                            {"name": call.name, "arguments": call.arguments}
+                            for call in calls
+                        ],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return ModelTurn(
+                content=message.content or "",
+                tool_calls=calls,
+                finish_reason=response.choices[0].finish_reason,
+                input_tokens=usage.prompt_tokens if usage else 0,
+                output_tokens=usage.completion_tokens if usage else 0,
+            )
+
+        async def execute_tool(
+            call: RuntimeToolCall,
+            arguments: dict[str, Any],
+        ) -> ToolOutcome:
+            category = ""
+            if call.name == "bash":
+                command = str(arguments.get("command", ""))
+                self.logger.info("Executing: %s", command[:240])
+                category = self._command_category(command)
+                if category in {"environment-discovery", "package-management", "qemu"} and self._recent_categories[-3:] == [category] * 3:
+                    return ToolOutcome(
+                        "Error: repeated the same kind of operation three times. Implement the required artifact or run focused verification.",
+                        is_error=True,
+                        counts_as_action=False,
+                    )
+                self._recent_categories.append(category)
+                self._recent_categories = self._recent_categories[-10:]
+                output = await self._exec_bash(environment, command)
+            elif call.name in {"rlm_peek", "rlm_search", "rlm_slice", "rlm_agent"}:
+                output = await self._execute_rlm(call.name, arguments)
+            else:
+                return ToolOutcome(f"Error: unknown tool {call.name}", is_error=True)
+            output = self._truncate(output)
+            return ToolOutcome(
+                output,
+                is_error=tool_output_is_error(call.name, output),
+                counts_as_action=call.name != "bash" or category not in {"inspection", "environment-discovery"},
+            )
+
+        async def on_turn(turn: ModelTurn) -> None:
+            tool_calls = [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    },
+                }
+                for call in turn.tool_calls
+            ]
+            message: dict[str, Any] = {
+                "role": "assistant",
+                "content": turn.content,
+            }
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            self._messages.append(message)
+            self._context.add(EntryType.ASSISTANT, "assistant", turn.content)
+            if not turn.content.strip() and not turn.tool_calls:
+                reminder = (
+                    "No actionable response was produced. Continue by calling bash now; "
+                    "do not stop until the requested artifact or behavior is verified."
+                )
+                self._messages.append({"role": "user", "content": reminder})
+                self._context.add(EntryType.USER, "user", reminder)
+            self._trajectory.append(
+                {
+                    "role": "assistant",
+                    "content": turn.content,
+                    "tool_calls": tool_calls or None,
+                }
+            )
+
+        async def on_tool(call: RuntimeToolCall, outcome: ToolOutcome) -> None:
+            self._messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": outcome.content,
+                }
+            )
+            self._context.add(
+                EntryType.TOOL_RESULT,
+                "tool",
+                outcome.content,
+                tool_name=call.name,
+                tool_id=call.id,
+            )
+            self._trajectory.append(
+                {
+                    "role": "tool_result",
+                    "content": outcome.content,
+                    "tool_name": call.name,
+                    "tool_id": call.id,
+                }
+            )
+            episode_dir = episode_dirs.get(self._episodes_run, self.logs_dir)
+            (episode_dir / f"tool-{call.id}.txt").write_text(
+                outcome.content,
+                encoding="utf-8",
+            )
+            self._sync_context(context)
+
+        async def emit(event: RuntimeEvent) -> None:
+            if event.kind == "error":
+                self.logger.warning("Runtime error: %s", event.content)
+            elif event.kind == "complete":
+                self.logger.info("Runtime completed: %s", event.content)
+
+        runtime = AgentRuntime(
+            task=instruction,
+            max_iterations=self._max_episodes,
+            call_model=call_model,
+            execute_tool=execute_tool,
+            on_turn=on_turn,
+            on_tool=on_tool,
+            emit=emit,
+        )
+        try:
+            result = await runtime.run()
+            context.metadata = {
+                **(context.metadata or {}),
+                "completed": result.completed,
+                "reason": result.reason,
+            }
+        finally:
+            self._sync_context(context)
+            (self.logs_dir / "messages.json").write_text(
+                json.dumps(self._messages, indent=2),
+                encoding="utf-8",
+            )
+            (self.logs_dir / "trajectory.json").write_text(
+                json.dumps(
+                    convert_to_atif(self._trajectory, self.session_id or "unknown"),
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
     async def _exec_bash(self, environment: BaseEnvironment, command: str) -> str:
         if not command.strip():
             return "Error: empty bash command"
+        started = time.perf_counter()
         try:
-            result = await environment.exec(command=command, timeout_sec=self._command_timeout)
+            result = await environment.exec(
+                command=f"set -o pipefail; {command}",
+                timeout_sec=self._command_timeout,
+            )
+            elapsed = time.perf_counter() - started
             output = []
             if result.stdout:
                 output.append(f"STDOUT:\n{result.stdout}")
             if result.stderr:
                 output.append(f"STDERR:\n{result.stderr}")
             output.append(f"EXIT CODE: {result.return_code}")
+            self.logger.info("bash finished in %.1fs with exit=%s", elapsed, result.return_code)
             return "\n".join(output)
         except TimeoutError:
+            self.logger.warning("bash timed out after %ss: %s", self._command_timeout, command[:240])
             return f"Error: command timed out after {self._command_timeout}s"
         except Exception as error:
             return f"Error executing command: {error}"
@@ -349,6 +604,38 @@ class Zsh28Code(BaseAgent):
         first = encoded[:half].decode("utf-8", errors="ignore")
         last = encoded[-half:].decode("utf-8", errors="ignore")
         return f"{first}\n[... truncated ...]\n{last}"
+
+    def _messages_for_model(self) -> list[dict[str, Any]]:
+        """Bound repeated prompt resubmission while preserving RLM history."""
+        if len(self._messages) <= 12:
+            return self._messages
+        return [
+            *self._messages[:2],
+            {
+                "role": "user",
+                "content": (
+                    "Older activity is available through RLM tools. Use them only "
+                    "if needed; implement the task now.\n\n"
+                    + self._context.recent_summary(max_tokens=2500)
+                ),
+            },
+            *self._messages[-8:],
+        ]
+
+    @staticmethod
+    def _command_category(command: str) -> str:
+        lowered = command.lower()
+        if re.search(r"\b(qemu|virsh|kvm)\b", lowered):
+            return "qemu"
+        if re.search(r"(>|>>|tee|touch|mkdir).*\/app", lowered):
+            return "implementation"
+        if re.search(r"\bfind\s+/|\blocate\s+/|\bwhich\s+(python|torch|conda)", lowered):
+            return "environment-discovery"
+        if re.search(r"\b(apt|pip|conda|npm|uv)\b", lowered):
+            return "package-management"
+        if re.search(r"\b(cat|sed|awk|grep|head|tail|ls|pwd)\b", lowered):
+            return "inspection"
+        return "other"
 
     def _sync_context(self, context: AgentContext) -> None:
         context.n_input_tokens = self._input_tokens

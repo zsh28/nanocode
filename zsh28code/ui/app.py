@@ -91,8 +91,6 @@ class StatusStrip(Static):
     """Thin status line at the bottom."""
 
     def __init__(self, status: str = "ready", model: str = ""):
-        dot = "●"
-        dot_style = "green" if status == "ready" else "yellow"
         super().__init__()
         self.status = status
         self.model = model

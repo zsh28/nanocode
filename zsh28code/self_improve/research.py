@@ -63,7 +63,9 @@ class Autoresearcher:
         logger.info(f"Autoresearch query: {query}")
 
         # Step 1: Web search
-        search_results = await self.web_search.execute(query=query, max_results=5)
+        search_results = await self.web_search.search(query, limit=5)
+        if isinstance(search_results, str):
+            search_results = []
 
         relevant_urls: list[str] = []
         key_findings: list[str] = []
@@ -79,7 +81,7 @@ class Autoresearcher:
             relevant_urls.append(url)
 
             try:
-                content = await self.web_fetch.execute(url=url)
+                content = await self.web_fetch.fetch(url)
                 # Extract key info from content
                 findings = self._extract_findings(content, task_description)
                 key_findings.extend(findings[:3])  # Top 3 per source
@@ -117,7 +119,9 @@ class Autoresearcher:
             ResearchResult with findings and recommendations
         """
         query = f"{task_type} task best practices {' '.join(keywords)}"
-        search_results = await self.web_search.execute(query=query, max_results=5)
+        search_results = await self.web_search.search(query, limit=5)
+        if isinstance(search_results, str):
+            search_results = []
 
         relevant_urls: list[str] = []
         key_findings: list[str] = []
@@ -127,7 +131,7 @@ class Autoresearcher:
             if url:
                 relevant_urls.append(url)
                 try:
-                    content = await self.web_fetch.execute(url=url)
+                    content = await self.web_fetch.fetch(url)
                     findings = self._extract_findings(content, task_type)
                     key_findings.extend(findings[:3])
                 except Exception:

@@ -7,6 +7,7 @@ tools (rlm_peek, rlm_search, rlm_slice, rlm_agent) to selectively access
 the full context.
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -18,6 +19,15 @@ from openai import AsyncOpenAI
 
 from zsh28code.config import Config
 from zsh28code.context import ContextStore, EntryType
+from zsh28code.runtime import (
+    AgentRuntime,
+    ModelTurn,
+    RuntimeEvent,
+    RuntimeToolCall,
+    ToolOutcome,
+    task_requires_action,
+    tool_output_is_error,
+)
 from zsh28code.tools import get_headless_tools
 from zsh28code.tools.base import Tool
 
@@ -59,6 +69,8 @@ class Agent:
         self.headless = headless
         self.approval_callback = approval_callback
         self._task_start_index = 0
+        self._task_description = ""
+        self._task_action_executed = False
 
         if tools is not None:
             self.tools = tools
@@ -258,11 +270,17 @@ but the completion signal must be on its own line as the last thing you do.
         """Start a fresh model task while retaining the searchable workspace history."""
         self._task_start_index = len(self.context._entries)
         self._iteration = 0
+        self._task_description = task
+        self._task_action_executed = False
         system_prompt = self._build_system_prompt(task)
         self.context.add(EntryType.SYSTEM, "system", system_prompt)
         self.context.add(EntryType.USER, "user", task)
         self._record_trajectory(role="system", content=system_prompt)
         self._record_trajectory(role="user", content=task)
+
+    def _requires_action(self) -> bool:
+        """Detect requests that require an observable tool action."""
+        return task_requires_action(self._task_description)
 
     def _should_summarize_tool_result(self, content: str, tool_name: str) -> str:
         """Determine if a tool result should be summarized or included directly.
@@ -296,10 +314,11 @@ but the completion signal must be on its own line as the last thing you do.
         kwargs: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
-            "tools": tool_schemas,
             "stream": True,
             "max_tokens": self.config.max_tokens,
         }
+        if tool_schemas:
+            kwargs["tools"] = tool_schemas
 
         # Add reasoning eff
         if self.config.reasoning_effort:
@@ -324,8 +343,6 @@ but the completion signal must be on its own line as the last thing you do.
                 continue
 
             if choice.delta.content:
-                if not self.headless:
-                    print(choice.delta.content, end="", flush=True)
                 reply += choice.delta.content
 
             for tc in choice.delta.tool_calls or []:
@@ -342,9 +359,6 @@ but the completion signal must be on its own line as the last thing you do.
 
             if choice.finish_reason:
                 finish_reason = choice.finish_reason
-
-        if not self.headless:
-            print()  # newline after streaming
 
         return reply, tool_calls, finish_reason
 
@@ -389,7 +403,117 @@ but the completion signal must be on its own line as the last thing you do.
             entry["tool_name"] = tool_name or ""
         self.trajectory.append(entry)
 
+    async def _run_shared_runtime(
+        self,
+        auto_approve: bool = False,
+        emit: Callable[[RuntimeEvent], Awaitable[None]] | None = None,
+    ) -> AgentResult:
+        """Run the mode-independent orchestration loop with local adapters."""
+
+        async def call_model(_iteration: int) -> ModelTurn:
+            messages = self._build_llm_input()
+            input_length = sum(
+                len(message.get("content", ""))
+                for message in messages
+                if isinstance(message.get("content"), str)
+            )
+            self._record_trajectory(
+                role="assistant_input",
+                content=f"[LLM input length: {input_length} chars]",
+            )
+            reply, calls, finish_reason = await self._call_llm(messages)
+            return ModelTurn(
+                content=reply,
+                tool_calls=[
+                    RuntimeToolCall(
+                        id=call["id"],
+                        name=call["name"],
+                        arguments=call["arguments"],
+                    )
+                    for call in calls
+                ],
+                finish_reason=finish_reason,
+            )
+
+        async def execute_tool(
+            call: RuntimeToolCall,
+            arguments: dict[str, Any],
+        ) -> ToolOutcome:
+            tool = self._tools_by_name.get(call.name)
+            if tool is None:
+                return ToolOutcome(f"Error: Unknown tool {call.name}", is_error=True)
+            if not auto_approve and not await self._approve_tool_call(tool, arguments):
+                return ToolOutcome("User denied the tool call.", is_error=True)
+            try:
+                result = await tool.execute(arguments)
+            except Exception as error:
+                return ToolOutcome(f"Error executing {call.name}: {error}", is_error=True)
+            is_error = tool_output_is_error(call.name, result)
+            return ToolOutcome(
+                result,
+                is_error=is_error,
+                counts_as_action=not tool.is_read_only,
+            )
+
+        async def on_turn(turn: ModelTurn) -> None:
+            calls = [
+                {"id": call.id, "name": call.name, "arguments": call.arguments}
+                for call in turn.tool_calls
+            ]
+            self._record_trajectory(
+                role="assistant",
+                content=turn.content,
+                tool_calls=calls or None,
+            )
+            call_summary = "\n".join(
+                f"Tool call: {call.name}({call.arguments})"
+                for call in turn.tool_calls
+            )
+            content = f"{turn.content}\n{call_summary}".strip()
+            self.context.add(EntryType.ASSISTANT, "assistant", content)
+
+        async def on_tool(call: RuntimeToolCall, outcome: ToolOutcome) -> None:
+            self.context.add(
+                EntryType.TOOL_RESULT,
+                "tool",
+                outcome.content,
+                tool_name=call.name,
+                tool_id=call.id,
+            )
+            self._record_trajectory(
+                role="tool_result",
+                content=outcome.content,
+                tool_name=call.name,
+            )
+            if self.headless:
+                display = self._should_summarize_tool_result(outcome.content, call.name)
+                print(f"\n[{call.name}] {display[:500]}", file=sys.stderr)
+
+        runtime = AgentRuntime(
+            task=self._task_description,
+            max_iterations=self.config.max_iterations,
+            call_model=call_model,
+            execute_tool=execute_tool,
+            on_turn=on_turn,
+            on_tool=on_tool,
+            emit=emit,
+        )
+        result = await runtime.run()
+        self._iteration = result.iterations
+        self._task_action_executed = runtime._action_succeeded
+        self._record_trajectory(role="exit", content=result.reason)
+        return AgentResult(
+            completed=result.completed,
+            submission=result.submission,
+            reason=result.reason,
+            iterations=result.iterations,
+            trajectory=self.trajectory,
+        )
+
     async def _loop(self, auto_approve: bool = False) -> AgentResult:
+        return await self._run_shared_runtime(auto_approve=auto_approve)
+
+    async def _legacy_loop(self, auto_approve: bool = False) -> AgentResult:
         """Main agent loop.
 
         1. Build focused LLM input (system + task + recent summary)
@@ -502,6 +626,9 @@ but the completion signal must be on its own line as the last thing you do.
                                     result = "User denied the tool call."
                                     is_error = True
 
+                    if not is_error:
+                        self._task_action_executed = True
+
                     # Store in context
                     self.context.add(
                         EntryType.TOOL_RESULT,
@@ -551,6 +678,16 @@ but the completion signal must be on its own line as the last thing you do.
                     continue
                 # A normal text response is the model's final answer. Requiring
                 if reply.strip():
+                    if self._requires_action() and not self._task_action_executed:
+                        reason = "The task requires a tool action, but no tool completed successfully."
+                        self._record_trajectory(role="exit", content=reason)
+                        return AgentResult(
+                            completed=False,
+                            submission=reply.strip(),
+                            reason=reason,
+                            iterations=self._iteration,
+                            trajectory=self.trajectory,
+                        )
                     self._record_trajectory(role="exit", content="Completed with final response.")
                     return AgentResult(
                         completed=True,
@@ -582,7 +719,7 @@ but the completion signal must be on its own line as the last thing you do.
 
         return await self._loop(auto_approve=True)
 
-    async def run_stream(self, task: str):
+    async def _legacy_run_stream(self, task: str):
         """Run the agent and yield messages incrementally for the TUI.
 
         Yields dicts: {"role": "assistant"|"tool", "content": str, "metadata": str}
@@ -674,6 +811,9 @@ but the completion signal must be on its own line as the last thing you do.
                             else:
                                 result, is_error = "User denied the tool call.", True
 
+                        if not is_error:
+                            self._task_action_executed = True
+
                     ts = _dt.datetime.now().strftime("%H:%M:%S")
                     yield {"role": "tool", "content": result, "metadata": f"[{tc['name']}] {ts}"}
 
@@ -698,7 +838,75 @@ but the completion signal must be on its own line as the last thing you do.
                     )
                     continue
                 if reply.strip():
+                    if self._requires_action() and not self._task_action_executed:
+                        yield {
+                            "role": "system",
+                            "content": "No tool completed successfully; the requested action was not verified.",
+                            "metadata": "zsh28code",
+                        }
+                        return
                     yield {"role": "status", "content": "responding", "metadata": ""}
                     return
 
         yield {"role": "system", "content": "Max iterations reached", "metadata": "zsh28code"}
+
+    async def run_stream(self, task: str):
+        """Run the shared runtime and expose its events to the Textual TUI."""
+        self._begin_task(task)
+        queue: asyncio.Queue[RuntimeEvent | None] = asyncio.Queue()
+
+        async def emit(event: RuntimeEvent) -> None:
+            await queue.put(event)
+
+        async def run_runtime() -> AgentResult:
+            try:
+                return await self._run_shared_runtime(auto_approve=False, emit=emit)
+            finally:
+                await queue.put(None)
+
+        runtime_task = asyncio.create_task(run_runtime())
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                if event.kind == "thinking":
+                    yield {
+                        "role": "status",
+                        "content": "thinking",
+                        "metadata": f"iteration {event.iteration}",
+                    }
+                elif event.kind == "assistant":
+                    yield {
+                        "role": "assistant",
+                        "content": event.content,
+                        "metadata": "AGENT",
+                    }
+                elif event.kind == "tool_start" and event.tool_call:
+                    yield {
+                        "role": "status",
+                        "content": f"running {event.tool_call.name}",
+                        "metadata": "",
+                    }
+                elif event.kind == "tool_result":
+                    yield {
+                        "role": "tool",
+                        "content": event.content,
+                        "metadata": event.tool_call.name if event.tool_call else "tool",
+                    }
+                elif event.kind == "complete":
+                    yield {"role": "status", "content": "responding", "metadata": ""}
+                elif event.kind == "error":
+                    yield {
+                        "role": "system",
+                        "content": event.content,
+                        "metadata": "zsh28code",
+                    }
+            await runtime_task
+        except asyncio.CancelledError:
+            runtime_task.cancel()
+            try:
+                await runtime_task
+            except asyncio.CancelledError:
+                pass
+            raise
